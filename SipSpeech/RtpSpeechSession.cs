@@ -15,9 +15,11 @@
 //-----------------------------------------------------------------------------
 
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Runtime.CompilerServices;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.CognitiveServices.Speech;
@@ -62,6 +64,7 @@ namespace sipspeech
         /// </summary>
         public short[] GetPcmBuffer()
         {
+            _ms.Position = 0;
             byte[] buffer = _ms.GetBuffer();
             short[] pcmBuffer = new short[_posn / 2];
 
@@ -71,6 +74,69 @@ namespace sipspeech
             }
 
             return pcmBuffer;
+        }
+
+        /// <summary>
+        /// Used to check if there is data waiting to be copied.
+        /// </summary>
+        /// <returns>True if the stream is empty. False if there is some data available.</returns>
+        public bool IsEmpty()
+        {
+            return _posn == 0;
+        }
+    }
+
+    class SpeechToTextAudioInStream : PullAudioInputStreamCallback
+    {
+        private const int MAX_BUFFER_QUEUE_LENGTH = 100;
+        private const int MAX_GETSAMPLE_ATTEMPTS = 10;
+
+        private ConcurrentQueue<byte[]> _bufferQueue = new ConcurrentQueue<byte[]>();
+        private ManualResetEvent _sampleReadyMre = new ManualResetEvent(false);
+
+        public void WriteSample(byte[] sample)
+        {
+            //Console.WriteLine($"SpeechToTextAudioInStream queueing sample of {sample.Length} bytes.");
+
+            _bufferQueue.Enqueue(sample);
+            _sampleReadyMre.Set();
+
+            while (_bufferQueue.Count > MAX_BUFFER_QUEUE_LENGTH)
+            {
+                Console.WriteLine("SpeechToTextAudioInStream queue exceeded max limit, dropping buffer.");
+                _bufferQueue.TryDequeue(out _);
+            }
+        }
+
+        public override int Read(byte[] dataBuffer, uint size)
+        {
+            //Console.WriteLine($"SpeechToTextAudioInStream read request for {size} bytes, current queue size {_bufferQueue.Count()}.");
+
+            if (_bufferQueue.Count == 0)
+            {
+                //Console.WriteLine("SpeechToTextAudioInStream waiting for sample to be queued.");
+                _sampleReadyMre.Reset();
+                _sampleReadyMre.WaitOne();
+            }
+
+            int attempts = 0;
+            while (attempts < MAX_GETSAMPLE_ATTEMPTS)
+            {
+                if (_bufferQueue.TryDequeue(out var sample))
+                {
+                    int count = (size > sample.Length) ? sample.Length : (int)size;
+                    Buffer.BlockCopy(sample, 0, dataBuffer, 0, count);
+
+                    return count;
+                }
+                else
+                {
+                    attempts++;
+                }
+            }
+
+            Console.WriteLine("SpeechToTextAudioInStream was unable to pop a sample off the queue.");
+            return 0;
         }
     }
 
@@ -85,6 +151,13 @@ namespace sipspeech
         private static readonly int AUDIO_CLOCK_RATE = SDPMediaFormatInfo.GetClockRate(SDPMediaFormatsEnum.G722);
         private static readonly int PCM_BUFFER_LENGTH = AUDIO_CLOCK_RATE * AUDIO_SAMPLE_PERIOD_MILLISECONDS / 1000;
 
+        /// <summary>
+        /// Values used for the flag used to track the state of the speech synthesizer and the RTP buffer.
+        /// </summary>
+        private const long TTS_IDLE = 0;
+        private const long TTS_BUSY = 1;
+        private const long TTS_RESULT_READY = 2;
+
         private static short[] _silencePcmBuffer = new short[PCM_BUFFER_LENGTH];    // Zero buffer representing PCM silence.
 
         private uint _rtpAudioTimestampPeriod = 0;
@@ -96,12 +169,35 @@ namespace sipspeech
 
         private G722Codec _g722Codec;
         private G722CodecState _g722CodecState;
+        private G722Codec _g722Decoder;
+        private G722CodecState _g722DecoderState;
 
         private SpeechSynthesizer _speechSynthesizer;
         private TextToSpeechAudioOutStream _ttsOutStream;
-        private bool _ttsReady = false;
+
+        private SpeechRecognizer _speechRecognizer;
+        private SpeechToTextAudioInStream _sttInStream;
+
+        /// <summary>
+        /// This buffer is used by the RTP sending thread. When it's informed that a text-to-speech job is complete
+        /// it will copy the contents from the speech synthesizer output stream into this buffer. This buffer then
+        /// gets used as the audio for RTP sends.
+        /// </summary>
         private short[] _ttsPcmBuffer;
+
+        /// <summary>
+        /// The current position in the RTP buffer. The RTP thread will continue to send sampled from the PCM buffer until
+        /// this position goes past the length of the buffer.
+        /// </summary>
         private int _ttsPcmBufferPosn = 0;
+
+        /// <summary>
+        /// Crude mechanism being used to co-ordinate the threads reading and writing to the text-to-speech buffer.
+        /// A value of 0 means the buffer is ready for a new operation.
+        /// A value of 1 means an existing operation is in progress.
+        /// A value of 2 means a text-to-speech operation has completed and a buffer is waiting to be copied by the RTP thread.
+        /// </summary>
+        private long _ttsBusyFlag = 0;
 
         private readonly ILogger _logger;
         private readonly IConfiguration _config;
@@ -133,27 +229,43 @@ namespace sipspeech
 
             _g722Codec = new G722Codec();
             _g722CodecState = new G722CodecState(AUDIO_RTP_CLOCK_RATE * G722_BITS_PER_SAMPLE, G722Flags.None);
+            _g722Decoder = new G722Codec();
+            _g722DecoderState = new G722CodecState(AUDIO_RTP_CLOCK_RATE * G722_BITS_PER_SAMPLE, G722Flags.None);
 
             // Where the magic (for processing received media) happens.
             base.OnRtpPacketReceived += RtpPacketReceived;
             base.OnRtpEvent += OnRtpDtmfEvent;
             this.OnDtmfTone += DtmfToneHandler;
 
-            InitialiseTextToSpeech();
+            InitialiseSpeech();
         }
 
         /// <summary>
-        /// Initialises the text to speech objects required to send requests to Azure.
+        /// Initialises the speech objects required to send requests to Azure.
         /// </summary>
-        private void InitialiseTextToSpeech()
+        private void InitialiseSpeech()
         {
             var speechConfig = SpeechConfig.FromSubscription(_config[CONFIG_SUBSCRIPTION_KEY], _config[CONFIG_REGION_KEY]);
 
+            // Create a speech synthesizer that outputs to the backing stream.
             _ttsOutStream = new TextToSpeechAudioOutStream();
-            AudioConfig audioConfig = AudioConfig.FromStreamOutput(_ttsOutStream);
+            AudioConfig audioTtsConfig = AudioConfig.FromStreamOutput(_ttsOutStream);
+            _speechSynthesizer = new SpeechSynthesizer(speechConfig, audioTtsConfig);
 
-            // Creates a speech synthesizer and outputs to the backing stream.
-            _speechSynthesizer = new SpeechSynthesizer(speechConfig, audioConfig);
+            // Create a speech recognizer that takes input from the backing stream.
+            _sttInStream = new SpeechToTextAudioInStream();
+            AudioConfig audioSttConfig = AudioConfig.FromStreamInput(_sttInStream);
+            _speechRecognizer = new SpeechRecognizer(speechConfig, audioSttConfig);
+            _speechRecognizer.SpeechStartDetected += (sender, e) => _logger.LogDebug($"Speech start detected {e.SessionId}.");
+            _speechRecognizer.SpeechEndDetected += (sender, e) => _logger.LogDebug($"Speech end detected {e.SessionId}.");
+            _speechRecognizer.SessionStarted += (sender, e) => _logger.LogDebug($"Speech recognizer session started {e.SessionId}.");
+            _speechRecognizer.SessionStopped += (sender, e) => _logger.LogDebug($"Speech recognizer session stopped {e.SessionId}.");
+            _speechRecognizer.Canceled += (sender, e) => _logger.LogDebug($"Speech recognizer cancelled {e.Reason} {e.SessionId}.");
+            _speechRecognizer.Recognizing += (sender, e) => _logger.LogDebug($"Speech recognizer recognizing result={e.Result} {e.SessionId}.");
+            _speechRecognizer.Recognized += (sender, e) =>
+            {
+                _logger.LogDebug($"Speech recognizer recognized result={e.Result.Text} {e.SessionId}.");
+            };
         }
 
         /// <summary>
@@ -195,68 +307,80 @@ namespace sipspeech
         /// <param name="tone">The tone that was pressed.</param>
         private void DtmfToneHandler(int tone)
         {
-            Task.Run(async () =>
+            if (Interlocked.Read(ref _ttsBusyFlag) == TTS_IDLE)
             {
-                switch (tone)
-                {
-                    case 0:
-                        await DoTextToSpeech("Hello and welcome to the SIP speech prototype.");
-                        break;
-                    case 1:
-                        await DoTextToSpeech("Peter Piper picked a peck of pickled peppers. A peck of pickled peppers Peter Piper picked.");
-                        break;
-                    default:
-                        await DoTextToSpeech("Sorry your selection was not a valid option.");
-                        break;
-                }
+                Interlocked.Exchange(ref _ttsBusyFlag, TTS_BUSY);
 
-                _logger.LogDebug($"DoTextToSpeech completed.");
-            });
+                Task.Run(async () =>
+                {
+                    bool result = false;
+
+                    switch (tone)
+                    {
+                        case 0:
+                            result = await DoTextToSpeech("Hello and welcome to the SIP speech prototype.");
+                            break;
+                        case 1:
+                            result = await DoTextToSpeech("Peter Piper picked a peck of pickled peppers. A peck of pickled peppers Peter Piper picked.");
+                            break;
+                        default:
+                            result = await DoTextToSpeech("Sorry your selection was not a valid option.");
+                            break;
+                    }
+
+                    _logger.LogDebug($"DoTextToSpeech completed result {result}.");
+
+                    if (result)
+                    {
+                            // Indicates a pending buffer is ready for the RTP thread.
+                            Interlocked.Exchange(ref _ttsBusyFlag, TTS_RESULT_READY);
+                    }
+                    else
+                    {
+                            // Something went wrong.
+                            _ttsOutStream.Clear();
+                        Interlocked.Exchange(ref _ttsBusyFlag, TTS_IDLE);
+                    }
+                });
+            }
+            else
+            {
+                _logger.LogWarning("A pending text to speech task is currently in progress.");
+            }
         }
 
         /// <summary>
         /// Does the work of sending text to Azure for speech synthesis and waits for the result.
         /// </summary>
         /// <param name="text">The text to get synthesized.</param>
-        private async Task DoTextToSpeech(string text)
+        private async Task<bool> DoTextToSpeech(string text)
         {
-            //if (Monitor.TryEnter(_ttsOutStream))
-            //{
-            //    try
-            //    {
-                    using (var result = await _speechSynthesizer.SpeakTextAsync(text))
-                    {
-                        if (result.Reason == ResultReason.SynthesizingAudioCompleted)
-                        {
-                            _logger.LogDebug($"Speech synthesized to speaker for text [{text}]");
-                            _ttsReady = true;
-                        }
-                        else if (result.Reason == ResultReason.Canceled)
-                        {
-                            var cancellation = SpeechSynthesisCancellationDetails.FromResult(result);
-                            _logger.LogWarning($"Speech synthesizer failed was cancelled, reason={cancellation.Reason}");
+            using (var result = await _speechSynthesizer.SpeakTextAsync(text))
+            {
+                if (result.Reason == ResultReason.SynthesizingAudioCompleted)
+                {
+                    _logger.LogDebug($"Speech synthesized to speaker for text [{text}]");
+                    return true;
+                }
+                else if (result.Reason == ResultReason.Canceled)
+                {
+                    var cancellation = SpeechSynthesisCancellationDetails.FromResult(result);
+                    _logger.LogWarning($"Speech synthesizer failed was cancelled, reason={cancellation.Reason}");
 
-                            if (cancellation.Reason == CancellationReason.Error)
-                            {
-                                _logger.LogWarning($"Speech synthesizer cancelled: ErrorCode={cancellation.ErrorCode}");
-                                _logger.LogWarning($"Speech synthesizer cancelled: ErrorDetails=[{cancellation.ErrorDetails}]");
-                            }
-                        }
-                        else
-                        {
-                            _logger.LogWarning($"Speech synthesizer failed with result {result.Reason} for text [{text}].");
-                        }
+                    if (cancellation.Reason == CancellationReason.Error)
+                    {
+                        _logger.LogWarning($"Speech synthesizer cancelled: ErrorCode={cancellation.ErrorCode}");
+                        _logger.LogWarning($"Speech synthesizer cancelled: ErrorDetails=[{cancellation.ErrorDetails}]");
                     }
-            //    }
-            //    finally
-            //    {
-            //        Monitor.Exit(_ttsOutStream);
-            //    }
-            //}
-            //else
-            //{
-            //    _logger.LogWarning("A speech synthesizer task is already in progress.");
-            //}
+
+                    return false;
+                }
+                else
+                {
+                    _logger.LogWarning($"Speech synthesizer failed with result {result.Reason} for text [{text}].");
+                    return false;
+                }
+            }
         }
 
         /// <summary>
@@ -278,6 +402,10 @@ namespace sipspeech
                 }
 
                 _audioStreamTimer = new Timer(SendRTPAudio, null, 0, AUDIO_SAMPLE_PERIOD_MILLISECONDS);
+
+                await _speechRecognizer.StartContinuousRecognitionAsync().ConfigureAwait(false);
+
+                _logger.LogDebug("Speech recognizer started.");
             }
         }
 
@@ -285,13 +413,15 @@ namespace sipspeech
         /// Closes the session.
         /// </summary>
         /// <param name="reason">Reason for the closure.</param>
-        public override void Close(string reason)
+        public override async void Close(string reason)
         {
             if (!_isClosed)
             {
                 _isClosed = true;
 
                 _speechSynthesizer?.Dispose();
+
+                await _speechRecognizer.StopContinuousRecognitionAsync().ConfigureAwait(false);
 
                 base.OnRtpPacketReceived -= RtpPacketReceived;
 
@@ -306,17 +436,20 @@ namespace sipspeech
         /// </summary>
         private void SendRTPAudio(object state)
         {
-            if (_ttsReady)
+            if (Interlocked.Read(ref _ttsBusyFlag) == TTS_RESULT_READY)
             {
+                // This lock is to stop the timer callback from trying to do multiple
+                // simultaneous copies.
                 lock (this)
                 {
-                    if (_ttsReady)
+                    if (!_ttsOutStream.IsEmpty())
                     {
                         _logger.LogDebug("Copying text-to-speech PCM buffer into RTP send PCM buffer.");
 
                         _ttsPcmBuffer = _ttsOutStream.GetPcmBuffer();
+                        _ttsPcmBufferPosn = 0;
                         _ttsOutStream.Clear();
-                        _ttsReady = false;
+                        Interlocked.Exchange(ref _ttsBusyFlag, TTS_IDLE);
                     }
                 }
             }
@@ -354,38 +487,22 @@ namespace sipspeech
 
             if (mediaType == SDPMediaTypesEnum.audio)
             {
-                //RenderAudio(rtpPacket);
+                var sample = rtpPacket.Payload;
+                short[] pcm16kSample = new short[sample.Length * 2];
+
+                _g722Decoder.Decode(_g722DecoderState, pcm16kSample, sample, sample.Length);
+
+                byte[] pcmBuffer = new byte[pcm16kSample.Length * 2];
+
+                for (int i = 0; i < pcm16kSample.Length; i++)
+                {
+                    // Little endian.
+                    pcmBuffer[i * 2] = (byte)(pcm16kSample[i] & 0xff);
+                    pcmBuffer[i * 2 + 1] = (byte)((pcm16kSample[i] >> 8) & 0xff);
+                }
+
+                _sttInStream.WriteSample(pcmBuffer);
             }
         }
-
-        /// <summary>
-        /// Render an audio RTP packet received from a remote party.
-        /// </summary>
-        /// <param name="rtpPacket">The RTP packet containing the audio payload.</param>
-        //private void RenderAudio(RTPPacket rtpPacket)
-        //{
-        //    if (_waveProvider != null)
-        //    {
-        //        var sample = rtpPacket.Payload;
-
-        //        for (int index = 0; index < sample.Length; index++)
-        //        {
-        //            short pcm = 0;
-
-        //            if (rtpPacket.Header.PayloadType == (int)SDPMediaFormatsEnum.PCMA)
-        //            {
-        //                pcm = NAudio.Codecs.ALawDecoder.ALawToLinearSample(sample[index]);
-        //                byte[] pcmSample = new byte[] { (byte)(pcm & 0xFF), (byte)(pcm >> 8) };
-        //                _waveProvider.AddSamples(pcmSample, 0, 2);
-        //            }
-        //            else
-        //            {
-        //                pcm = NAudio.Codecs.MuLawDecoder.MuLawToLinearSample(sample[index]);
-        //                byte[] pcmSample = new byte[] { (byte)(pcm & 0xFF), (byte)(pcm >> 8) };
-        //                _waveProvider.AddSamples(pcmSample, 0, 2);
-        //            }
-        //        }
-        //    }
-        //}
     }
 }

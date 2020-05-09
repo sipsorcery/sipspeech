@@ -28,7 +28,7 @@ using SIPSorcery.Net;
 using SIPSorcery.SIP.App;
 
 namespace sipspeech
-{ 
+{
     class TtsAudioOutStream : PushAudioOutputStreamCallback
     {
         public MemoryStream ms = new MemoryStream();
@@ -67,6 +67,7 @@ namespace sipspeech
         private SDPMediaFormat _sendingAudioFormat = null;
         private bool _isStarted = false;
         private bool _isClosed = false;
+        private uint _rtpEventSsrc;
         private Timer _audioStreamTimer;
 
         private G722Codec _g722Codec;
@@ -103,6 +104,36 @@ namespace sipspeech
 
             // Where the magic (for processing received media) happens.
             base.OnRtpPacketReceived += RtpPacketReceived;
+            base.OnRtpEvent += OnRtpDtmfEvent;
+        }
+
+        /// <summary>
+        /// Events handler for an RTP event being received from the remote call party.
+        /// The only RTP events we offer to accept are DTMF tones.
+        /// </summary>
+        /// <param name="rtpEvent">The RTP event that was received.</param>
+        /// <param name="rtpHeader">The header on the RTP packet that the event was received in.</param>
+        private void OnRtpDtmfEvent(RTPEvent rtpEvent, RTPHeader rtpHeader)
+        {
+            if (_rtpEventSsrc == 0)
+            {
+                if(rtpEvent.EndOfEvent && rtpHeader.MarkerBit == 1)
+                {
+                    // Full event is contained in a single RTP packet.
+                    _logger.LogDebug($"RTP event {rtpEvent.EventID}.");
+                }
+                else if(!rtpEvent.EndOfEvent)
+                {
+                    _logger.LogDebug($"RTP event {rtpEvent.EventID}.");
+                    _rtpEventSsrc = rtpHeader.SyncSource;
+                }
+            }
+
+            if (_rtpEventSsrc != 0 && rtpEvent.EndOfEvent)
+            {
+                //_logger.LogDebug($"RTP end of event {rtpEvent.EventID}.");
+                _rtpEventSsrc = 0;
+            }
         }
 
         /// <summary>

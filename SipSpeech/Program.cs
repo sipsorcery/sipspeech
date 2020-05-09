@@ -19,15 +19,14 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
 using System.Net;
-using System.Net.NetworkInformation;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
-using Microsoft.Extensions.Logging.Console;
+using Serilog;
+using Serilog.Sinks.SystemConsole.Themes;
 using SIPSorcery.Media;
-using SIPSorcery.Net;
 using SIPSorcery.SIP;
 using SIPSorcery.SIP.App;
 using SIPSorcery.Sys;
@@ -50,14 +49,13 @@ namespace sipspeech
         }
     }
 
-
     class Program
     {
         private const string APP_CONFIG_FILE = "appsettings.json";
         private const string MAIN_LOGGER_PREFIX = "main";
         private const int SIP_LISTEN_PORT = 5060;
 
-        private static ILogger logger;
+        private static Microsoft.Extensions.Logging.ILogger logger;
         private static ServiceProvider _serviceProvider;
 
         /// <summary>
@@ -87,10 +85,16 @@ namespace sipspeech
                 .AddJsonFile(APP_CONFIG_FILE, false, false)
                 .Build();
 
+            var serilogConfig = new Serilog.LoggerConfiguration()
+                .Enrich.FromLogContext()
+                .MinimumLevel.Is(Serilog.Events.LogEventLevel.Debug)
+                .WriteTo.Console(theme: AnsiConsoleTheme.Code)
+                .CreateLogger();
+
             _serviceProvider = new ServiceCollection()
                 .AddLogging(loggingBuilder => 
                 {
-                    loggingBuilder.AddConsole(opts => opts.Format = ConsoleLoggerFormat.Systemd);
+                    loggingBuilder.AddSerilog(serilogConfig);
                     loggingBuilder.SetMinimumLevel(LogLevel.Debug); 
                 })
                 .AddSingleton<IConfiguration>(config)
@@ -272,8 +276,8 @@ namespace sipspeech
                     SIPUserAgent ua = new SIPUserAgent(_sipTransport, null);
                     ua.OnCallHungup += OnHangup;
                     ua.ServerCallCancelled += (uas) => logger.LogDebug("Incoming call cancelled by remote party.");
-                    ua.OnDtmfTone += (key, duration) => OnDtmfTone(ua, key, duration);
-                    ua.OnRtpEvent += (evt, hdr) => logger.LogDebug($"rtp event {evt.EventID}, duration {evt.Duration}, end of event {evt.EndOfEvent}, timestamp {hdr.Timestamp}, marker {hdr.MarkerBit}.");
+                    //ua.OnDtmfTone += (key, duration) => OnDtmfTone(ua, key, duration);
+                    //ua.OnRtpEvent += (evt, hdr) => logger.LogDebug($"rtp event {evt.EventID}, duration {evt.Duration}, end of event {evt.EndOfEvent}, timestamp {hdr.Timestamp}, marker {hdr.MarkerBit}.");
                     ua.OnTransactionTraceMessage += (tx, msg) => logger.LogDebug($"uas tx {tx.TransactionId}: {msg}");
                     ua.ServerCallRingTimeout += (uas) =>
                     {

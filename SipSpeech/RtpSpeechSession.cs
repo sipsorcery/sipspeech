@@ -32,14 +32,32 @@ using SIPSorcery.SIP.App;
 
 namespace sipspeech
 {
+    /// <summary>
+    /// This is the backing class for the Azure text-to-speech service call. It will
+    /// have the results of the text-to-speech request pushed into its stream buffer which
+    /// can be retrieved for subsequent operations such as sending via RTP.
+    /// </summary>
     class TextToSpeechAudioOutStream : PushAudioOutputStreamCallback
     {
+        private readonly ILogger _logger;
+
         public MemoryStream _ms = new MemoryStream();
         private int _posn = 0;
 
+        public TextToSpeechAudioOutStream(ILogger logger)
+        {
+            _logger = logger;
+        }
+
+        /// <summary>
+        /// This gets called by the internals of the Azure text-to-speech SDK to write the resultant
+        /// PCM 16Khz 16 bit audio samples.
+        /// </summary>
+        /// <param name="dataBuffer">The data buffer containing the audio sample.</param>
+        /// <returns>The number of bytes written from the supplied sample.</returns>
         public override uint Write(byte[] dataBuffer)
         {
-            Console.WriteLine($"Bytes written to output stream {dataBuffer.Length}.");
+            //_logger.LogDebug($"TextToSpeechAudioOutStream bytes written to output stream {dataBuffer.Length}.");
 
             _ms.Write(dataBuffer, 0, dataBuffer.Length);
             _posn = _posn + dataBuffer.Length;
@@ -47,20 +65,19 @@ namespace sipspeech
             return (uint)dataBuffer.Length;
         }
 
+        /// <summary>
+        /// Closes the stream.
+        /// </summary>
         public override void Close()
         {
             _ms.Close();
             base.Close();
         }
 
-        public void Clear()
-        {
-            _ms.SetLength(0);
-            _posn = 0;
-        }
-
         /// <summary>
         /// Get the current contents of the memory stream as a buffer of PCM samples.
+        /// The PCM samples are suitable to be fed into an audio codec as part of the 
+        /// RTP send.
         /// </summary>
         public short[] GetPcmBuffer()
         {
@@ -77,6 +94,16 @@ namespace sipspeech
         }
 
         /// <summary>
+        /// Clear is intended to be called after the method to get the PCM buffer.
+        /// It will reset the underlying memory buffer ready for the next text-to-speech operation.
+        /// </summary>
+        public void Clear()
+        {
+            _ms.SetLength(0);
+            _posn = 0;
+        }
+
+        /// <summary>
         /// Used to check if there is data waiting to be copied.
         /// </summary>
         /// <returns>True if the stream is empty. False if there is some data available.</returns>
@@ -86,57 +113,117 @@ namespace sipspeech
         }
     }
 
+    /// <summary>
+    /// This is the backing class for the Azure speech recognizer service. It needs to have the
+    /// PCM 16Khz 16 bit audio samples pushed from the application. The Azure SDK internals then call 
+    /// read to get the data.
+    /// </summary>
     class SpeechToTextAudioInStream : PullAudioInputStreamCallback
     {
         private const int MAX_BUFFER_QUEUE_LENGTH = 100;
         private const int MAX_GETSAMPLE_ATTEMPTS = 10;
+        private const int NO_SAMPLE_TIMEOUT_MILLISECONDS = 100;
+
+        private readonly ILogger _logger;
 
         private ConcurrentQueue<byte[]> _bufferQueue = new ConcurrentQueue<byte[]>();
         private ManualResetEvent _sampleReadyMre = new ManualResetEvent(false);
+        private bool _closed;
 
+        public SpeechToTextAudioInStream(ILogger logger)
+        {
+            _logger = logger;
+        }
+
+        /// <summary>
+        /// This methods gets called by the application to add audio samples for the
+        /// speech recognition task.
+        /// </summary>
+        /// <param name="sample">The PCM 16Khz 16bit audio samples.</param>
         public void WriteSample(byte[] sample)
         {
-            //Console.WriteLine($"SpeechToTextAudioInStream queueing sample of {sample.Length} bytes.");
-
-            _bufferQueue.Enqueue(sample);
-            _sampleReadyMre.Set();
-
-            while (_bufferQueue.Count > MAX_BUFFER_QUEUE_LENGTH)
+            if (!_closed)
             {
-                Console.WriteLine("SpeechToTextAudioInStream queue exceeded max limit, dropping buffer.");
-                _bufferQueue.TryDequeue(out _);
+                _bufferQueue.Enqueue(sample);
+                _sampleReadyMre.Set();
+
+                while (_bufferQueue.Count > MAX_BUFFER_QUEUE_LENGTH)
+                {
+                    _logger.LogWarning("SpeechToTextAudioInStream queue exceeded max limit, dropping buffer.");
+                    _bufferQueue.TryDequeue(out _);
+                }
             }
         }
 
+        /// <summary>
+        /// This methods gets called by the Azure SDK internals when it requires a new audio sample.
+        /// </summary>
+        /// <param name="dataBuffer">The buffer to copy the output samples to.</param>
+        /// <param name="size">The amount of data required in the buffer.</param>
+        /// <returns>The number of bytes that were supplied.</returns>
         public override int Read(byte[] dataBuffer, uint size)
         {
-            //Console.WriteLine($"SpeechToTextAudioInStream read request for {size} bytes, current queue size {_bufferQueue.Count()}.");
+            //_logger.LogDebug($"SpeechToTextAudioInStream read requested {size} bytes.");
 
-            if (_bufferQueue.Count == 0)
+            if (!_closed)
             {
-                //Console.WriteLine("SpeechToTextAudioInStream waiting for sample to be queued.");
-                _sampleReadyMre.Reset();
-                _sampleReadyMre.WaitOne();
+                if (_bufferQueue.Count == 0)
+                {
+                    _sampleReadyMre.Reset();
+                    _sampleReadyMre.WaitOne(NO_SAMPLE_TIMEOUT_MILLISECONDS);
+                }
+
+                int attempts = 0;
+
+                // The mechanism below is a little bit tricky and could probably be improved.
+                // The constraints are:
+                // - Samples are being supplied as they arrive over the RTP connection.
+                // - Samples reads are being requested by the Azure SDK at a separate (and probably different) rate.
+                // - The size of the RTP samples and the size of the data requested by a read can be different.
+                // - It was observed if the data was not supplied to the reader fast enough the speech recognizer would stop.
+                // - If the available sample is smaller than the data requested it is better to supply it and not wait for more data.
+
+                while (attempts < MAX_GETSAMPLE_ATTEMPTS && !_closed)
+                {
+                    if (_bufferQueue.TryDequeue(out var sample))
+                    {
+                        int count = (size > (sample.Length)) ? sample.Length : (int)size - sample.Length;
+                        Buffer.BlockCopy(sample, 0, dataBuffer, 0, count);
+
+                        //_logger.LogDebug($"SpeechToTextAudioInStream read {count} bytes.");
+
+                        return count;
+                    }
+                    else
+                    {
+                        //_logger.LogDebug($"SpeechToTextAudioInStream failed to get a sample from queue.");
+                        attempts++;
+                    }
+                }
+
+                if (!_closed)
+                {
+                    _logger.LogWarning("SpeechToTextAudioInStream was unable to ready any data within the allotted period.");
+                }
             }
 
-            int attempts = 0;
-            while (attempts < MAX_GETSAMPLE_ATTEMPTS)
-            {
-                if (_bufferQueue.TryDequeue(out var sample))
-                {
-                    int count = (size > sample.Length) ? sample.Length : (int)size;
-                    Buffer.BlockCopy(sample, 0, dataBuffer, 0, count);
+            // We don't have any data but if we return 0 the stream recognizer will stop.
+            // Instead return the number of bytes requested. This should result in the buffer detecting silence.
+            // The hope is the next RTP audio sample will arrive to avoid the recognizer detecting a long pause.
+            return (int)size;
+        }
 
-                    return count;
-                }
-                else
-                {
-                    attempts++;
-                }
-            }
+        /// <summary>
+        /// Closes the stream. Only to be called when the speech recognizer instance is no longer required.
+        /// </summary>
+        public override void Close()
+        {
+            _closed = true;
 
-            Console.WriteLine("SpeechToTextAudioInStream was unable to pop a sample off the queue.");
-            return 0;
+            _bufferQueue.Clear();
+            _sampleReadyMre.Set();
+
+            base.Close();
         }
     }
 
@@ -248,12 +335,12 @@ namespace sipspeech
             var speechConfig = SpeechConfig.FromSubscription(_config[CONFIG_SUBSCRIPTION_KEY], _config[CONFIG_REGION_KEY]);
 
             // Create a speech synthesizer that outputs to the backing stream.
-            _ttsOutStream = new TextToSpeechAudioOutStream();
+            _ttsOutStream = new TextToSpeechAudioOutStream(_logger);
             AudioConfig audioTtsConfig = AudioConfig.FromStreamOutput(_ttsOutStream);
             _speechSynthesizer = new SpeechSynthesizer(speechConfig, audioTtsConfig);
 
             // Create a speech recognizer that takes input from the backing stream.
-            _sttInStream = new SpeechToTextAudioInStream();
+            _sttInStream = new SpeechToTextAudioInStream(_logger);
             AudioConfig audioSttConfig = AudioConfig.FromStreamInput(_sttInStream);
             _speechRecognizer = new SpeechRecognizer(speechConfig, audioSttConfig);
             _speechRecognizer.SpeechStartDetected += (sender, e) => _logger.LogDebug($"Speech start detected {e.SessionId}.");
@@ -332,13 +419,13 @@ namespace sipspeech
 
                     if (result)
                     {
-                            // Indicates a pending buffer is ready for the RTP thread.
-                            Interlocked.Exchange(ref _ttsBusyFlag, TTS_RESULT_READY);
+                        // Indicates a pending buffer is ready for the RTP thread.
+                        Interlocked.Exchange(ref _ttsBusyFlag, TTS_RESULT_READY);
                     }
                     else
                     {
-                            // Something went wrong.
-                            _ttsOutStream.Clear();
+                        // Something went wrong.
+                        _ttsOutStream.Clear();
                         Interlocked.Exchange(ref _ttsBusyFlag, TTS_IDLE);
                     }
                 });
@@ -413,17 +500,19 @@ namespace sipspeech
         /// Closes the session.
         /// </summary>
         /// <param name="reason">Reason for the closure.</param>
-        public override async void Close(string reason)
+        public override void Close(string reason)
         {
             if (!_isClosed)
             {
                 _isClosed = true;
 
-                _speechSynthesizer?.Dispose();
-
-                await _speechRecognizer.StopContinuousRecognitionAsync().ConfigureAwait(false);
-
                 base.OnRtpPacketReceived -= RtpPacketReceived;
+
+                _sttInStream.Close();
+                _speechSynthesizer?.Dispose();
+                // During testing it takes a while for the speech recognizer to stop.
+                // Provided it doesn't throw (which it shouldn't) it's safe not to await.
+                _speechRecognizer.StopContinuousRecognitionAsync();
 
                 base.Close(reason);
 
@@ -483,8 +572,6 @@ namespace sipspeech
         /// <param name="rtpPacket">The RTP packet with the media sample.</param>
         private void RtpPacketReceived(SDPMediaTypesEnum mediaType, RTPPacket rtpPacket)
         {
-            //Log.LogDebug($"RTP packet received for {mediaType}.");
-
             if (mediaType == SDPMediaTypesEnum.audio)
             {
                 var sample = rtpPacket.Payload;

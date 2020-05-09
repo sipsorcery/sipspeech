@@ -21,6 +21,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.CognitiveServices.Speech;
 using Microsoft.CognitiveServices.Speech.Audio;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using SIPSorcery.Media;
 using SIPSorcery.Net;
@@ -53,14 +54,12 @@ namespace sipspeech
     public class RtpSpeechSession : RTPSession, IMediaSession
     {
         private const int AUDIO_SAMPLE_PERIOD_MILLISECONDS = 20;
-        private const int AUDIO_BYTES_PER_SAMPLE = 2;               // G722 uses 16 bit samples.
+        //private const int AUDIO_BYTES_PER_SAMPLE = 2;               // G722 uses 16 bit samples.
         private const int G722_BITS_PER_SAMPLE = 8;
 
         private static readonly int AUDIO_RTP_CLOCK_RATE = SDPMediaFormatInfo.GetRtpClockRate(SDPMediaFormatsEnum.G722);
         private static readonly int AUDIO_CLOCK_RATE = SDPMediaFormatInfo.GetClockRate(SDPMediaFormatsEnum.G722);
         private static readonly int SILENCE_PCM_BUFFER_LENGTH = AUDIO_CLOCK_RATE * AUDIO_SAMPLE_PERIOD_MILLISECONDS / 1000;
-
-        private static Microsoft.Extensions.Logging.ILogger Log = SIPSorcery.Sys.Log.Logger;
 
         private static short[] _silencePcmBuffer = new short[SILENCE_PCM_BUFFER_LENGTH];    // Zero buffer representing PCM silence.
 
@@ -73,13 +72,19 @@ namespace sipspeech
         private G722Codec _g722Codec;
         private G722CodecState _g722CodecState;
 
+        private readonly ILogger _logger;
+        private readonly IConfiguration _config;
+
         /// <summary>
         /// Creates a new basic RTP session that captures and generates and processes audio
         /// stream using Azure services.
         /// </summary>
-        public RtpSpeechSession()
+        public RtpSpeechSession(ILoggerFactory loggerFactory, IConfiguration config)
             : base(false, false, false)
         {
+            _logger = loggerFactory.CreateLogger<RtpSpeechSession>();
+            _config = config;
+
             // G722 is the best codec match for the 16k PCM format the speech services use.
             var g722 = new SDPMediaFormat(SDPMediaFormatsEnum.G722);
 

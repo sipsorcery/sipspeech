@@ -19,18 +19,20 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
 using System.Net;
+using System.Net.NetworkInformation;
 using System.Threading;
 using System.Threading.Tasks;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
-using Serilog;
-using Serilog.Sinks.SystemConsole.Themes;
+using Microsoft.Extensions.Logging.Console;
 using SIPSorcery.Media;
 using SIPSorcery.Net;
 using SIPSorcery.SIP;
 using SIPSorcery.SIP.App;
 using SIPSorcery.Sys;
 
-namespace sipspeech 
+namespace sipspeech
 {
     struct SIPRegisterAccount
     {
@@ -48,23 +50,15 @@ namespace sipspeech
         }
     }
 
-    struct SendSilenceJob
-    {
-        public Timer SendSilenceTimer;
-        public SIPUserAgent UserAgent;
-
-        public SendSilenceJob(Timer timer, SIPUserAgent ua)
-        {
-            SendSilenceTimer = timer;
-            UserAgent = ua;
-        }
-    }
 
     class Program
     {
-        private static int SIP_LISTEN_PORT = 5060;
+        private const string APP_CONFIG_FILE = "appsettings.json";
+        private const string MAIN_LOGGER_PREFIX = "main";
+        private const int SIP_LISTEN_PORT = 5060;
 
-        private static Microsoft.Extensions.Logging.ILogger Log = SIPSorcery.Sys.Log.Logger;
+        private static ILogger logger;
+        private static ServiceProvider _serviceProvider;
 
         /// <summary>
         /// The set of SIP accounts available for registering and/or authenticating calls.
@@ -88,6 +82,24 @@ namespace sipspeech
 
         static async Task Main()
         {
+            // Plumbing to set up logging, config and dependency injection.
+            IConfiguration config = new ConfigurationBuilder()
+                .AddJsonFile(APP_CONFIG_FILE, false, false)
+                .Build();
+
+            _serviceProvider = new ServiceCollection()
+                .AddLogging(loggingBuilder => 
+                {
+                    loggingBuilder.AddConsole(opts => opts.Format = ConsoleLoggerFormat.Systemd);
+                    loggingBuilder.SetMinimumLevel(LogLevel.Debug); 
+                })
+                .AddSingleton<IConfiguration>(config)
+                .AddTransient<IMediaSession, RtpSpeechSession>()
+                .BuildServiceProvider();
+
+            logger = _serviceProvider.GetService<ILoggerFactory>().CreateLogger(MAIN_LOGGER_PREFIX);
+            SIPSorcery.Sys.Log.LoggerFactory = _serviceProvider.GetService<ILoggerFactory>();
+
             Console.WriteLine("SIP Speech Server example.");
             Console.WriteLine("Press 'd' to send a random DTMF tone to the newest call.");
             Console.WriteLine("Press 'h' to hangup the oldest call.");
@@ -95,8 +107,6 @@ namespace sipspeech
             Console.WriteLine("Press 'l' to list current calls.");
             Console.WriteLine("Press 'r' to list current registrations.");
             Console.WriteLine("Press 'q' to quit.");
-
-            AddConsoleLogger();
 
             // Set up a default SIP transport.
             _sipTransport = new SIPTransport();
@@ -113,13 +123,13 @@ namespace sipspeech
             CancellationTokenSource exitCts = new CancellationTokenSource();
             await Task.Run(() => OnKeyPress(exitCts.Token));
 
-            Log.LogInformation("Exiting...");
+            logger.LogInformation("Exiting...");
 
             SIPSorcery.Net.DNSManager.Stop();
 
             if (_sipTransport != null)
             {
-                Log.LogInformation("Shutting down SIP transport...");
+                logger.LogInformation("Shutting down SIP transport...");
                 _sipTransport.Shutdown();
             }
         }
@@ -140,13 +150,13 @@ namespace sipspeech
                     {
                         if (_calls.Count == 0)
                         {
-                            Log.LogWarning("There are no active calls.");
+                            logger.LogWarning("There are no active calls.");
                         }
                         else
                         {
                             var newestCall = _calls.OrderByDescending(x => x.Value.Dialogue.Inserted).First();
                             byte randomDtmf = (byte)Crypto.GetRandomInt(0, 15);
-                            Log.LogInformation($"Sending DTMF {randomDtmf} to {newestCall.Key}.");
+                            logger.LogInformation($"Sending DTMF {randomDtmf} to {newestCall.Key}.");
                             await newestCall.Value.SendDtmf(randomDtmf);
                         }
                     }
@@ -154,12 +164,12 @@ namespace sipspeech
                     {
                         if (_calls.Count == 0)
                         {
-                            Log.LogWarning("There are no active calls.");
+                            logger.LogWarning("There are no active calls.");
                         }
                         else
                         {
                             var oldestCall = _calls.OrderBy(x => x.Value.Dialogue.Inserted).First();
-                            Log.LogInformation($"Hanging up call {oldestCall.Key}.");
+                            logger.LogInformation($"Hanging up call {oldestCall.Key}.");
                             oldestCall.Value.OnCallHungup -= OnHangup;
                             oldestCall.Value.Hangup();
                             _calls.TryRemove(oldestCall.Key, out _);
@@ -169,13 +179,13 @@ namespace sipspeech
                     {
                         if (_calls.Count == 0)
                         {
-                            Log.LogWarning("There are no active calls.");
+                            logger.LogWarning("There are no active calls.");
                         }
                         else
                         {
                             foreach (var call in _calls)
                             {
-                                Log.LogInformation($"Hanging up call {call.Key}.");
+                                logger.LogInformation($"Hanging up call {call.Key}.");
                                 call.Value.OnCallHungup -= OnHangup;
                                 call.Value.Hangup();
                             }
@@ -186,17 +196,17 @@ namespace sipspeech
                     {
                         if (_calls.Count == 0)
                         {
-                            Log.LogInformation("There are no active calls.");
+                            logger.LogInformation("There are no active calls.");
                         }
                         else
                         {
-                            Log.LogInformation("Current call list:");
+                            logger.LogInformation("Current call list:");
                             foreach (var call in _calls)
                             {
                                 int duration = Convert.ToInt32(DateTimeOffset.Now.Subtract(call.Value.Dialogue.Inserted).TotalSeconds);
                                 uint rtpSent = (call.Value.MediaSession as RtpAudioSession).RtpPacketsSent;
                                 uint rtpRecv = (call.Value.MediaSession as RtpAudioSession).RtpPacketsReceived;
-                                Log.LogInformation($"{call.Key}: {call.Value.Dialogue.RemoteTarget} {duration}s {rtpSent}/{rtpRecv}");
+                                logger.LogInformation($"{call.Key}: {call.Value.Dialogue.RemoteTarget} {duration}s {rtpSent}/{rtpRecv}");
                             }
                         }
                     }
@@ -204,68 +214,29 @@ namespace sipspeech
                     {
                         if (_registrations.Count == 0)
                         {
-                            Log.LogInformation("There are no active registrations.");
+                            logger.LogInformation("There are no active registrations.");
                         }
                         else
                         {
-                            Log.LogInformation("Current registration list:");
+                            logger.LogInformation("Current registration list:");
                             foreach (var registration in _registrations)
                             {
-                                Log.LogInformation($"{registration.Key}: is registered {registration.Value.IsRegistered}, last attempt at {registration.Value.LastRegisterAttemptAt}");
+                                logger.LogInformation($"{registration.Key}: is registered {registration.Value.IsRegistered}, last attempt at {registration.Value.LastRegisterAttemptAt}");
                             }
                         }
                     }
                     else if (keyProps.KeyChar == 'q')
                     {
                         // Quit application.
-                        Log.LogInformation("Quitting");
+                        logger.LogInformation("Quitting");
                         break;
                     }
                 }
             }
             catch (Exception excp)
             {
-                Log.LogError($"Exception OnKeyPress. {excp.Message}.");
+                logger.LogError($"Exception OnKeyPress. {excp.Message}.");
             }
-        }
-
-        /// <summary>
-        /// Creates an RTP speech session and hooks up the event handlers.
-        /// </summary>
-        /// <param name="ua">The user agent the RTP session is being created for.</param>
-        /// <returns>A new RTP session object.</returns>
-        private static RtpSpeechSession CreateRtpSession(SIPUserAgent ua)
-        {
-            var rtpSpeechSession = new RtpSpeechSession();
-
-            // Wire up the event handler for RTP packets received from the remote party.
-            rtpSpeechSession.OnRtpPacketReceived += (type, rtp) => OnRtpPacketReceived(ua, type, rtp);
-            rtpSpeechSession.OnTimeout += (mediaType) =>
-            {
-                if (ua?.Dialogue != null)
-                {
-                    Log.LogWarning($"RTP timeout on call with {ua.Dialogue.RemoteTarget}, hanging up.");
-                }
-                else
-                {
-                    Log.LogWarning($"RTP timeout on incomplete call, closing RTP session.");
-                }
-
-                ua.Hangup();
-            };
-
-            return rtpSpeechSession;
-        }
-
-        /// <summary>
-        /// Event handler for receiving RTP packets.
-        /// </summary>
-        /// <param name="ua">The SIP user agent associated with the RTP session.</param>
-        /// <param name="type">The media type of the RTP packet (audio or video).</param>
-        /// <param name="rtpPacket">The RTP packet received from the remote party.</param>
-        private static void OnRtpPacketReceived(SIPUserAgent ua, SDPMediaTypesEnum type, RTPPacket rtpPacket)
-        {
-            // The raw audio data is available in rtpPacket.Payload.
         }
 
         /// <summary>
@@ -277,7 +248,7 @@ namespace sipspeech
         private static void OnDtmfTone(SIPUserAgent ua, byte key, int duration)
         {
             string callID = ua.Dialogue.CallId;
-            Log.LogInformation($"Call {callID} received DTMF tone {key}, duration {duration}ms.");
+            logger.LogInformation($"Call {callID} received DTMF tone {key}, duration {duration}ms.");
         }
 
         /// <summary>
@@ -296,22 +267,22 @@ namespace sipspeech
                 }
                 else if (sipRequest.Method == SIPMethodsEnum.INVITE)
                 {
-                    Log.LogInformation($"Incoming call request: {localSIPEndPoint}<-{remoteEndPoint} {sipRequest.URI}.");
+                    logger.LogInformation($"Incoming call request: {localSIPEndPoint}<-{remoteEndPoint} {sipRequest.URI}.");
 
                     SIPUserAgent ua = new SIPUserAgent(_sipTransport, null);
                     ua.OnCallHungup += OnHangup;
-                    ua.ServerCallCancelled += (uas) => Log.LogDebug("Incoming call cancelled by remote party.");
+                    ua.ServerCallCancelled += (uas) => logger.LogDebug("Incoming call cancelled by remote party.");
                     ua.OnDtmfTone += (key, duration) => OnDtmfTone(ua, key, duration);
-                    ua.OnRtpEvent += (evt, hdr) => Log.LogDebug($"rtp event {evt.EventID}, duration {evt.Duration}, end of event {evt.EndOfEvent}, timestamp {hdr.Timestamp}, marker {hdr.MarkerBit}.");
-                    ua.OnTransactionTraceMessage += (tx, msg) => Log.LogDebug($"uas tx {tx.TransactionId}: {msg}");
+                    ua.OnRtpEvent += (evt, hdr) => logger.LogDebug($"rtp event {evt.EventID}, duration {evt.Duration}, end of event {evt.EndOfEvent}, timestamp {hdr.Timestamp}, marker {hdr.MarkerBit}.");
+                    ua.OnTransactionTraceMessage += (tx, msg) => logger.LogDebug($"uas tx {tx.TransactionId}: {msg}");
                     ua.ServerCallRingTimeout += (uas) =>
                     {
-                        Log.LogWarning($"Incoming call timed out in {uas.ClientTransaction.TransactionState} state waiting for client ACK, terminating.");
+                        logger.LogWarning($"Incoming call timed out in {uas.ClientTransaction.TransactionState} state waiting for client ACK, terminating.");
                         ua.Hangup();
                     };
 
                     var uas = ua.AcceptCall(sipRequest);
-                    var rtpSession = CreateRtpSession(ua);
+                    var rtpSession = _serviceProvider.GetService<IMediaSession>();
 
                     // Insert a brief delay to allow testing of the "Ringing" progress response.
                     // Without the delay the call gets answered before it can be sent.
@@ -343,7 +314,7 @@ namespace sipspeech
             }
             catch (Exception reqExcp)
             {
-                Log.LogWarning($"Exception handling {sipRequest.Method}. {reqExcp.Message}");
+                logger.LogWarning($"Exception handling {sipRequest.Method}. {reqExcp.Message}");
             }
         }
 
@@ -375,10 +346,10 @@ namespace sipspeech
                 var regUserAgent = new SIPRegistrationUserAgent(sipTransport, sipAccount.Username, sipAccount.Password, sipAccount.Domain, sipAccount.Expiry);
 
                 // Event handlers for the different stages of the registration.
-                regUserAgent.RegistrationFailed += (uri, err) => Log.LogError($"{uri.ToString()}: {err}");
-                regUserAgent.RegistrationTemporaryFailure += (uri, msg) => Log.LogWarning($"{uri.ToString()}: {msg}");
-                regUserAgent.RegistrationRemoved += (uri) => Log.LogError($"{uri.ToString()} registration failed.");
-                regUserAgent.RegistrationSuccessful += (uri) => Log.LogInformation($"{uri.ToString()} registration succeeded.");
+                regUserAgent.RegistrationFailed += (uri, err) => logger.LogError($"{uri.ToString()}: {err}");
+                regUserAgent.RegistrationTemporaryFailure += (uri, msg) => logger.LogWarning($"{uri.ToString()}: {msg}");
+                regUserAgent.RegistrationRemoved += (uri) => logger.LogError($"{uri.ToString()} registration failed.");
+                regUserAgent.RegistrationSuccessful += (uri) => logger.LogInformation($"{uri.ToString()} registration succeeded.");
 
                 // Start the thread to perform the initial registration and then periodically resend it.
                 regUserAgent.Start();
@@ -388,89 +359,74 @@ namespace sipspeech
         }
 
         /// <summary>
-        ///  Adds a console logger. Can be omitted if internal SIPSorcery debug and warning messages are not required.
-        /// </summary>
-        private static void AddConsoleLogger()
-        {
-            var loggerFactory = new Microsoft.Extensions.Logging.LoggerFactory();
-            var loggerConfig = new LoggerConfiguration()
-                .Enrich.FromLogContext()
-                .MinimumLevel.Is(Serilog.Events.LogEventLevel.Debug)
-                .WriteTo.Console(theme: AnsiConsoleTheme.Code)
-                .CreateLogger();
-            loggerFactory.AddSerilog(loggerConfig);
-            SIPSorcery.Sys.Log.LoggerFactory = loggerFactory;
-        }
-
-        /// <summary>
         /// Enable detailed SIP log messages.
         /// </summary>
         private static void EnableTraceLogs(SIPTransport sipTransport, bool fullSIP)
         {
             sipTransport.SIPRequestInTraceEvent += (localEP, remoteEP, req) =>
             {
-                Log.LogDebug($"Request received: {localEP}<-{remoteEP}");
+                logger.LogDebug($"Request received: {localEP}<-{remoteEP}");
 
                 if (!fullSIP)
                 {
-                    Log.LogDebug(req.StatusLine);
+                    logger.LogDebug(req.StatusLine);
                 }
                 else
                 {
-                    Log.LogDebug(req.ToString());
+                    logger.LogDebug(req.ToString());
                 }
             };
 
             sipTransport.SIPRequestOutTraceEvent += (localEP, remoteEP, req) =>
             {
-                Log.LogDebug($"Request sent: {localEP}->{remoteEP}");
+                logger.LogDebug($"Request sent: {localEP}->{remoteEP}");
 
                 if (!fullSIP)
                 {
-                    Log.LogDebug(req.StatusLine);
+                    logger.LogDebug(req.StatusLine);
                 }
                 else
                 {
-                    Log.LogDebug(req.ToString());
+                    logger.LogDebug(req.ToString());
                 }
             };
 
             sipTransport.SIPResponseInTraceEvent += (localEP, remoteEP, resp) =>
             {
-                Log.LogDebug($"Response received: {localEP}<-{remoteEP}");
+                logger.LogDebug($"Response received: {localEP}<-{remoteEP}");
 
                 if (!fullSIP)
                 {
-                    Log.LogDebug(resp.ShortDescription);
+                    logger.LogDebug(resp.ShortDescription);
                 }
                 else
                 {
-                    Log.LogDebug(resp.ToString());
+                    logger.LogDebug(resp.ToString());
                 }
             };
 
             sipTransport.SIPResponseOutTraceEvent += (localEP, remoteEP, resp) =>
             {
-                Log.LogDebug($"Response sent: {localEP}->{remoteEP}");
+                logger.LogDebug($"Response sent: {localEP}->{remoteEP}");
 
                 if (!fullSIP)
                 {
-                    Log.LogDebug(resp.ShortDescription);
+                    logger.LogDebug(resp.ShortDescription);
                 }
                 else
                 {
-                    Log.LogDebug(resp.ToString());
+                    logger.LogDebug(resp.ToString());
                 }
             };
 
             sipTransport.SIPRequestRetransmitTraceEvent += (tx, req, count) =>
             {
-                Log.LogDebug($"Request retransmit {count} for request {req.StatusLine}, initial transmit {DateTime.Now.Subtract(tx.InitialTransmit).TotalSeconds.ToString("0.###")}s ago.");
+                logger.LogDebug($"Request retransmit {count} for request {req.StatusLine}, initial transmit {DateTime.Now.Subtract(tx.InitialTransmit).TotalSeconds.ToString("0.###")}s ago.");
             };
 
             sipTransport.SIPResponseRetransmitTraceEvent += (tx, resp, count) =>
             {
-                Log.LogDebug($"Response retransmit {count} for response {resp.ShortDescription}, initial transmit {DateTime.Now.Subtract(tx.InitialTransmit).TotalSeconds.ToString("0.###")}s ago.");
+                logger.LogDebug($"Response retransmit {count} for response {resp.ShortDescription}, initial transmit {DateTime.Now.Subtract(tx.InitialTransmit).TotalSeconds.ToString("0.###")}s ago.");
             };
         }
     }

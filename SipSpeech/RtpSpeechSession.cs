@@ -17,6 +17,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.CognitiveServices.Speech;
@@ -29,39 +30,62 @@ using SIPSorcery.SIP.App;
 
 namespace sipspeech
 {
-    class TtsAudioOutStream : PushAudioOutputStreamCallback
+    class TextToSpeechAudioOutStream : PushAudioOutputStreamCallback
     {
-        public MemoryStream ms = new MemoryStream();
-        int offSet = 0;
+        public MemoryStream _ms = new MemoryStream();
+        private int _posn = 0;
 
         public override uint Write(byte[] dataBuffer)
         {
             Console.WriteLine($"Bytes written to output stream {dataBuffer.Length}.");
 
-            ms.Write(dataBuffer, 0, dataBuffer.Length);
-            offSet = offSet + dataBuffer.Length;
+            _ms.Write(dataBuffer, 0, dataBuffer.Length);
+            _posn = _posn + dataBuffer.Length;
 
             return (uint)dataBuffer.Length;
         }
 
         public override void Close()
         {
-            ms.Close();
+            _ms.Close();
             base.Close();
+        }
+
+        public void Clear()
+        {
+            _ms.SetLength(0);
+            _posn = 0;
+        }
+
+        /// <summary>
+        /// Get the current contents of the memory stream as a buffer of PCM samples.
+        /// </summary>
+        public short[] GetPcmBuffer()
+        {
+            byte[] buffer = _ms.GetBuffer();
+            short[] pcmBuffer = new short[_posn / 2];
+
+            for (int i = 0; i < pcmBuffer.Length; i++)
+            {
+                pcmBuffer[i] = BitConverter.ToInt16(buffer, i * 2);
+            }
+
+            return pcmBuffer;
         }
     }
 
     public class RtpSpeechSession : RTPSession, IMediaSession
     {
         private const int AUDIO_SAMPLE_PERIOD_MILLISECONDS = 20;
-        //private const int AUDIO_BYTES_PER_SAMPLE = 2;               // G722 uses 16 bit samples.
         private const int G722_BITS_PER_SAMPLE = 8;
+        private const string CONFIG_SUBSCRIPTION_KEY = "SubscriptionKey";
+        private const string CONFIG_REGION_KEY = "Region";
 
         private static readonly int AUDIO_RTP_CLOCK_RATE = SDPMediaFormatInfo.GetRtpClockRate(SDPMediaFormatsEnum.G722);
         private static readonly int AUDIO_CLOCK_RATE = SDPMediaFormatInfo.GetClockRate(SDPMediaFormatsEnum.G722);
-        private static readonly int SILENCE_PCM_BUFFER_LENGTH = AUDIO_CLOCK_RATE * AUDIO_SAMPLE_PERIOD_MILLISECONDS / 1000;
+        private static readonly int PCM_BUFFER_LENGTH = AUDIO_CLOCK_RATE * AUDIO_SAMPLE_PERIOD_MILLISECONDS / 1000;
 
-        private static short[] _silencePcmBuffer = new short[SILENCE_PCM_BUFFER_LENGTH];    // Zero buffer representing PCM silence.
+        private static short[] _silencePcmBuffer = new short[PCM_BUFFER_LENGTH];    // Zero buffer representing PCM silence.
 
         private uint _rtpAudioTimestampPeriod = 0;
         private SDPMediaFormat _sendingAudioFormat = null;
@@ -73,8 +97,16 @@ namespace sipspeech
         private G722Codec _g722Codec;
         private G722CodecState _g722CodecState;
 
+        private SpeechSynthesizer _speechSynthesizer;
+        private TextToSpeechAudioOutStream _ttsOutStream;
+        private bool _ttsReady = false;
+        private short[] _ttsPcmBuffer;
+        private int _ttsPcmBufferPosn = 0;
+
         private readonly ILogger _logger;
         private readonly IConfiguration _config;
+
+        public Action<int> OnDtmfTone;
 
         /// <summary>
         /// Creates a new basic RTP session that captures and generates and processes audio
@@ -105,6 +137,23 @@ namespace sipspeech
             // Where the magic (for processing received media) happens.
             base.OnRtpPacketReceived += RtpPacketReceived;
             base.OnRtpEvent += OnRtpDtmfEvent;
+            this.OnDtmfTone += DtmfToneHandler;
+
+            InitialiseTextToSpeech();
+        }
+
+        /// <summary>
+        /// Initialises the text to speech objects required to send requests to Azure.
+        /// </summary>
+        private void InitialiseTextToSpeech()
+        {
+            var speechConfig = SpeechConfig.FromSubscription(_config[CONFIG_SUBSCRIPTION_KEY], _config[CONFIG_REGION_KEY]);
+
+            _ttsOutStream = new TextToSpeechAudioOutStream();
+            AudioConfig audioConfig = AudioConfig.FromStreamOutput(_ttsOutStream);
+
+            // Creates a speech synthesizer and outputs to the backing stream.
+            _speechSynthesizer = new SpeechSynthesizer(speechConfig, audioConfig);
         }
 
         /// <summary>
@@ -117,15 +166,19 @@ namespace sipspeech
         {
             if (_rtpEventSsrc == 0)
             {
-                if(rtpEvent.EndOfEvent && rtpHeader.MarkerBit == 1)
+                if (rtpEvent.EndOfEvent && rtpHeader.MarkerBit == 1)
                 {
                     // Full event is contained in a single RTP packet.
                     _logger.LogDebug($"RTP event {rtpEvent.EventID}.");
+
+                    OnDtmfTone?.Invoke((int)rtpEvent.EventID);
                 }
-                else if(!rtpEvent.EndOfEvent)
+                else if (!rtpEvent.EndOfEvent)
                 {
                     _logger.LogDebug($"RTP event {rtpEvent.EventID}.");
                     _rtpEventSsrc = rtpHeader.SyncSource;
+
+                    OnDtmfTone?.Invoke((int)rtpEvent.EventID);
                 }
             }
 
@@ -134,6 +187,76 @@ namespace sipspeech
                 //_logger.LogDebug($"RTP end of event {rtpEvent.EventID}.");
                 _rtpEventSsrc = 0;
             }
+        }
+
+        /// <summary>
+        /// Test actions to check text to speech integration.
+        /// </summary>
+        /// <param name="tone">The tone that was pressed.</param>
+        private void DtmfToneHandler(int tone)
+        {
+            Task.Run(async () =>
+            {
+                switch (tone)
+                {
+                    case 0:
+                        await DoTextToSpeech("Hello and welcome to the SIP speech prototype.");
+                        break;
+                    case 1:
+                        await DoTextToSpeech("Peter Piper picked a peck of pickled peppers. A peck of pickled peppers Peter Piper picked.");
+                        break;
+                    default:
+                        await DoTextToSpeech("Sorry your selection was not a valid option.");
+                        break;
+                }
+
+                _logger.LogDebug($"DoTextToSpeech completed.");
+            });
+        }
+
+        /// <summary>
+        /// Does the work of sending text to Azure for speech synthesis and waits for the result.
+        /// </summary>
+        /// <param name="text">The text to get synthesized.</param>
+        private async Task DoTextToSpeech(string text)
+        {
+            //if (Monitor.TryEnter(_ttsOutStream))
+            //{
+            //    try
+            //    {
+                    using (var result = await _speechSynthesizer.SpeakTextAsync(text))
+                    {
+                        if (result.Reason == ResultReason.SynthesizingAudioCompleted)
+                        {
+                            _logger.LogDebug($"Speech synthesized to speaker for text [{text}]");
+                            _ttsReady = true;
+                        }
+                        else if (result.Reason == ResultReason.Canceled)
+                        {
+                            var cancellation = SpeechSynthesisCancellationDetails.FromResult(result);
+                            _logger.LogWarning($"Speech synthesizer failed was cancelled, reason={cancellation.Reason}");
+
+                            if (cancellation.Reason == CancellationReason.Error)
+                            {
+                                _logger.LogWarning($"Speech synthesizer cancelled: ErrorCode={cancellation.ErrorCode}");
+                                _logger.LogWarning($"Speech synthesizer cancelled: ErrorDetails=[{cancellation.ErrorDetails}]");
+                            }
+                        }
+                        else
+                        {
+                            _logger.LogWarning($"Speech synthesizer failed with result {result.Reason} for text [{text}].");
+                        }
+                    }
+            //    }
+            //    finally
+            //    {
+            //        Monitor.Exit(_ttsOutStream);
+            //    }
+            //}
+            //else
+            //{
+            //    _logger.LogWarning("A speech synthesizer task is already in progress.");
+            //}
         }
 
         /// <summary>
@@ -168,6 +291,8 @@ namespace sipspeech
             {
                 _isClosed = true;
 
+                _speechSynthesizer?.Dispose();
+
                 base.OnRtpPacketReceived -= RtpPacketReceived;
 
                 base.Close(reason);
@@ -181,12 +306,41 @@ namespace sipspeech
         /// </summary>
         private void SendRTPAudio(object state)
         {
-            short[] pcmInput = _silencePcmBuffer;
-            byte[] encoded = new byte[pcmInput.Length / 2];
+            if (_ttsReady)
+            {
+                lock (this)
+                {
+                    if (_ttsReady)
+                    {
+                        _logger.LogDebug("Copying text-to-speech PCM buffer into RTP send PCM buffer.");
 
-            _g722Codec.Encode(_g722CodecState, encoded, pcmInput, pcmInput.Length);
+                        _ttsPcmBuffer = _ttsOutStream.GetPcmBuffer();
+                        _ttsOutStream.Clear();
+                        _ttsReady = false;
+                    }
+                }
+            }
 
-            base.SendAudioFrame((uint)encoded.Length, Convert.ToInt32(_sendingAudioFormat.FormatID), encoded);
+            if (_ttsPcmBuffer != null && _ttsPcmBufferPosn + PCM_BUFFER_LENGTH < _ttsPcmBuffer.Length)
+            {
+                // There are text to speech samples to send.
+                byte[] encoded = new byte[PCM_BUFFER_LENGTH / 2];
+
+                _g722Codec.Encode(_g722CodecState, encoded, _ttsPcmBuffer.Skip(_ttsPcmBufferPosn).ToArray(), PCM_BUFFER_LENGTH);
+
+                base.SendAudioFrame((uint)encoded.Length, Convert.ToInt32(_sendingAudioFormat.FormatID), encoded);
+
+                _ttsPcmBufferPosn += PCM_BUFFER_LENGTH;
+            }
+            else
+            {
+                short[] pcmInput = _silencePcmBuffer;
+                byte[] encoded = new byte[pcmInput.Length / 2];
+
+                _g722Codec.Encode(_g722CodecState, encoded, pcmInput, pcmInput.Length);
+
+                base.SendAudioFrame((uint)encoded.Length, Convert.ToInt32(_sendingAudioFormat.FormatID), encoded);
+            }
         }
 
         /// <summary>

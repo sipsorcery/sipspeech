@@ -51,9 +51,9 @@ One additional step is to ensure that the softphone has the `G722` codec enabled
 
 When the program receives a call it will automatically answer.
 
-To test the text-to-speech integration press a number on the softphone keypad to send a DTMF tone. Some hard coded text messages have been wired up to keys `0`, `1` and `2`. A generic propmpt is played for all other keys.
+To test the text-to-speech integration press a number on the softphone keypad to send a DTMF tone. Some hard coded text messages have been wired up to keys `0`, `1` and `2`. A generic prompt is played for all other keys.
 
-To test the speech-to-text integration speak into the microphone and within a short space of time an event from the `Speech Recognizer` service should appear on the consolre. An example is shown below:
+To test the speech-to-text integration speak into the microphone and within a short space of time an event from the `Speech Recognizer` service should appear on the console. An example is shown below:
 
 ````
 [10:34:47 DBG] Speech recognizer recognizing result=ResultId:5cf48a9763f6465ba4cd29de699c43c6 Reason:RecognizingSpeech Recognized text:<hello>. Json:{"Duration":3100000,"Id":"a3372807460346c6b3900a6c6e9d4d80","Offset":12500000,"Text":"hello"} bbe2c63d3ba74ddf8d368fe49c3b8a9e.

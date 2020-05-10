@@ -410,6 +410,9 @@ namespace sipspeech
                         case 1:
                             result = await DoTextToSpeech("Peter Piper picked a peck of pickled peppers. A peck of pickled peppers Peter Piper picked.");
                             break;
+                        case 2:
+                            result = await DoTextToSpeech($"The time is {DateTime.Now.Hour}, {DateTime.Now.Minute}, {DateTime.Now.Second}.");
+                            break;
                         default:
                             result = await DoTextToSpeech("Sorry your selection was not a valid option.");
                             break;

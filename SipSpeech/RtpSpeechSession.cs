@@ -32,13 +32,15 @@ namespace sipspeech
     public class RtpSpeechSession : RTPSession, IMediaSession
     {
         private const int AUDIO_SAMPLE_PERIOD_MILLISECONDS = 20;
-        private const int G722_BITS_PER_SAMPLE = 8;
+        //private const int G722_BITS_PER_SAMPLE = 8;
         private const string CONFIG_SUBSCRIPTION_KEY = "SubscriptionKey";
         private const string CONFIG_REGION_KEY = "Region";
 
-        private static readonly int AUDIO_RTP_CLOCK_RATE = SDPMediaFormatInfo.GetRtpClockRate(SDPMediaFormatsEnum.G722);
-        private static readonly int AUDIO_CLOCK_RATE = SDPMediaFormatInfo.GetClockRate(SDPMediaFormatsEnum.G722);
+        private static readonly int AUDIO_RTP_CLOCK_RATE = SDPMediaFormatInfo.GetRtpClockRate(SDPMediaFormatsEnum.PCMU);
+        private static readonly int AUDIO_CLOCK_RATE = SDPMediaFormatInfo.GetClockRate(SDPMediaFormatsEnum.PCMU);
         private static readonly int PCM_BUFFER_LENGTH = AUDIO_CLOCK_RATE * AUDIO_SAMPLE_PERIOD_MILLISECONDS / 1000;
+        private static readonly byte PCMU_SILENCE_BYTE_ZERO = 0x7F;
+        private static readonly byte PCMU_SILENCE_BYTE_ONE = 0xFF;
 
         /// <summary>
         /// Values used for the flag used to track the state of the speech synthesizer and the RTP buffer.
@@ -47,7 +49,7 @@ namespace sipspeech
         private const long TTS_BUSY = 1;
         private const long TTS_RESULT_READY = 2;
 
-        private static short[] _silencePcmBuffer = new short[PCM_BUFFER_LENGTH];    // Zero buffer representing PCM silence.
+        //private static short[] _silencePcmBuffer = new short[PCM_BUFFER_LENGTH];    // Zero buffer representing PCM silence.
 
         private uint _rtpAudioTimestampPeriod = 0;
         private SDPMediaFormat _sendingAudioFormat = null;
@@ -56,10 +58,10 @@ namespace sipspeech
         private uint _rtpEventSsrc;
         private Timer _audioStreamTimer;
 
-        private G722Codec _g722Codec;
-        private G722CodecState _g722CodecState;
-        private G722Codec _g722Decoder;
-        private G722CodecState _g722DecoderState;
+        //private G722Codec _g722Codec;
+        //private G722CodecState _g722CodecState;
+        //private G722Codec _g722Decoder;
+        //private G722CodecState _g722DecoderState;
 
         private SpeechSynthesizer _speechSynthesizer;
         private TextToSpeechStream _ttsOutStream;
@@ -104,22 +106,24 @@ namespace sipspeech
             _config = config;
 
             // G722 is the best codec match for the 16k PCM format the speech services use.
-            var g722 = new SDPMediaFormat(SDPMediaFormatsEnum.G722);
+            // Twilio (who the integration test is being done with) don't support G722 so need
+            // to stick to G711.
+            var pcmu = new SDPMediaFormat(SDPMediaFormatsEnum.PCMU);
 
             // RTP event support.
             SDPMediaFormat rtpEventFormat = new SDPMediaFormat(DTMF_EVENT_PAYLOAD_ID);
             rtpEventFormat.SetFormatAttribute($"{SDP.TELEPHONE_EVENT_ATTRIBUTE}/{AUDIO_RTP_CLOCK_RATE}");
             rtpEventFormat.SetFormatParameterAttribute("0-16");
 
-            var audioCapabilities = new List<SDPMediaFormat> { g722, rtpEventFormat };
+            var audioCapabilities = new List<SDPMediaFormat> { pcmu, rtpEventFormat };
 
             MediaStreamTrack audioTrack = new MediaStreamTrack(null, SDPMediaTypesEnum.audio, false, audioCapabilities);
             addTrack(audioTrack);
 
-            _g722Codec = new G722Codec();
-            _g722CodecState = new G722CodecState(AUDIO_RTP_CLOCK_RATE * G722_BITS_PER_SAMPLE, G722Flags.None);
-            _g722Decoder = new G722Codec();
-            _g722DecoderState = new G722CodecState(AUDIO_RTP_CLOCK_RATE * G722_BITS_PER_SAMPLE, G722Flags.None);
+            //_g722Codec = new G722Codec();
+            //_g722CodecState = new G722CodecState(AUDIO_RTP_CLOCK_RATE * G722_BITS_PER_SAMPLE, G722Flags.None);
+            //_g722Decoder = new G722Codec();
+            //_g722DecoderState = new G722CodecState(AUDIO_RTP_CLOCK_RATE * G722_BITS_PER_SAMPLE, G722Flags.None);
 
             // Where the magic (for processing received media) happens.
             base.OnRtpPacketReceived += RtpPacketReceived;
@@ -326,7 +330,9 @@ namespace sipspeech
         }
 
         /// <summary>
-        /// Timer callback to send the RTP audio packets.
+        /// Timer callback to send the RTP audio packets to the remote SIP party.
+        /// The audio will be generated from the result of a text-to-speech operation if available
+        /// and silence in between.
         /// </summary>
         private void SendRTPAudio(object state)
         {
@@ -348,30 +354,46 @@ namespace sipspeech
                 }
             }
 
-            if (_ttsPcmBuffer != null && _ttsPcmBufferPosn + PCM_BUFFER_LENGTH < _ttsPcmBuffer.Length)
+            uint bufferSize = (uint)(AUDIO_CLOCK_RATE / 1000 * AUDIO_SAMPLE_PERIOD_MILLISECONDS);
+            byte[] sample = new byte[bufferSize];
+
+            if (_ttsPcmBuffer != null && _ttsPcmBufferPosn + (bufferSize * 2) < _ttsPcmBuffer.Length)
             {
                 // There are text to speech samples to send.
-                byte[] encoded = new byte[PCM_BUFFER_LENGTH / 2];
+                //byte[] encoded = new byte[PCM_BUFFER_LENGTH / 2];
+                //_g722Codec.Encode(_g722CodecState, encoded, _ttsPcmBuffer.Skip(_ttsPcmBufferPosn).ToArray(), PCM_BUFFER_LENGTH);
 
-                _g722Codec.Encode(_g722CodecState, encoded, _ttsPcmBuffer.Skip(_ttsPcmBufferPosn).ToArray(), PCM_BUFFER_LENGTH);
+                // Important note. The text-to-speech service supplies 16k audio. The Twilio SIP server only supports 8k audio.
+                // To down sample we only encode every second sample!
 
-                base.SendAudioFrame((uint)encoded.Length, Convert.ToInt32(_sendingAudioFormat.FormatID), encoded);
+                for (int index = 0; index < bufferSize; index++)
+                {
+                    sample[index] = MuLawEncoder.LinearToMuLawSample(_ttsPcmBuffer[_ttsPcmBufferPosn]);
 
-                _ttsPcmBufferPosn += PCM_BUFFER_LENGTH;
+                    // Skip every second sample as the mechanism to down sample from 16K to 8K.
+                    _ttsPcmBufferPosn += 2;
+                }
             }
             else
             {
-                short[] pcmInput = _silencePcmBuffer;
-                byte[] encoded = new byte[pcmInput.Length / 2];
+                //short[] pcmInput = _silencePcmBuffer;
+                //byte[] encoded = new byte[pcmInput.Length / 2];
 
-                _g722Codec.Encode(_g722CodecState, encoded, pcmInput, pcmInput.Length);
+                //_g722Codec.Encode(_g722CodecState, encoded, pcmInput, pcmInput.Length);
 
-                base.SendAudioFrame((uint)encoded.Length, Convert.ToInt32(_sendingAudioFormat.FormatID), encoded);
+                for (int index = 0; index < bufferSize; index += 2)
+                {
+                    sample[index] = PCMU_SILENCE_BYTE_ZERO;
+                    sample[index + 1] = PCMU_SILENCE_BYTE_ONE;
+                }
             }
+
+            base.SendAudioFrame((uint)sample.Length, Convert.ToInt32(_sendingAudioFormat.FormatID), sample);
         }
 
         /// <summary>
-        /// Event handler for receiving RTP packets from a remote party.
+        /// Event handler for receiving RTP packets from the remote SIP party. These samples
+        /// need to be decoded into PCM16K samples and sent to the speech-to-text service.
         /// </summary>
         /// <param name="mediaType">The media type of the packets.</param>
         /// <param name="rtpPacket">The RTP packet with the media sample.</param>
@@ -379,21 +401,40 @@ namespace sipspeech
         {
             if (mediaType == SDPMediaTypesEnum.audio)
             {
+                //var sample = rtpPacket.Payload;
+                //short[] pcm16kSample = new short[sample.Length * 2];
+
+                //_g722Decoder.Decode(_g722DecoderState, pcm16kSample, sample, sample.Length);
+
+                //byte[] pcmBuffer = new byte[pcm16kSample.Length * 2];
+
+                //for (int i = 0; i < pcm16kSample.Length; i++)
+                //{
+                //    // Little endian.
+                //    pcmBuffer[i * 2] = (byte)(pcm16kSample[i] & 0xff);
+                //    pcmBuffer[i * 2 + 1] = (byte)((pcm16kSample[i] >> 8) & 0xff);
+                //}
+
+                // Important note. The speech-to-text service requires16k audio. The Twilio SIP server only supports 8k audio.
+                // To up sample we duplicate every sample!
+
                 var sample = rtpPacket.Payload;
-                short[] pcm16kSample = new short[sample.Length * 2];
 
-                _g722Decoder.Decode(_g722DecoderState, pcm16kSample, sample, sample.Length);
+                byte[] pcm16kBuffer = new byte[sample.Length * 4];
 
-                byte[] pcmBuffer = new byte[pcm16kSample.Length * 2];
-
-                for (int i = 0; i < pcm16kSample.Length; i++)
+                for (int i = 0; i < sample.Length; i++)
                 {
+                    short pcm8kSample = MuLawDecoder.MuLawToLinearSample(sample[i]);
+
+                    // Doubling up each PCM 8K sample to make a 16K sample.
                     // Little endian.
-                    pcmBuffer[i * 2] = (byte)(pcm16kSample[i] & 0xff);
-                    pcmBuffer[i * 2 + 1] = (byte)((pcm16kSample[i] >> 8) & 0xff);
+                    pcm16kBuffer[i * 4] = (byte)(pcm8kSample & 0xff);
+                    pcm16kBuffer[i * 4 + 1] = (byte)(pcm8kSample >> 8 & 0xff);
+                    pcm16kBuffer[i * 4 + 2] = (byte)(pcm8kSample & 0xff);
+                    pcm16kBuffer[i * 4 + 3] = (byte)(pcm8kSample >> 8 & 0xff);
                 }
 
-                _sttInStream.WriteSample(pcmBuffer);
+                _sttInStream.WriteSample(pcm16kBuffer);
             }
         }
     }
